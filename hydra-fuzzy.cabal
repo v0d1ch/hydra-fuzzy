@@ -1,0 +1,57 @@
+cabal-version: 3.0
+name:          hydra-fuzzy
+version:       0.1.0
+synopsis:      Random action fuzzer for a running Hydra Head
+license:       Apache-2.0
+author:        IOG
+maintainer:    sasha.bogicevic@iohk.io
+
+common project-config
+  default-language:   GHC2021
+  default-extensions:
+    DataKinds
+    DefaultSignatures
+    DeriveAnyClass
+    DerivingStrategies
+    FunctionalDependencies
+    GADTs
+    LambdaCase
+    MultiWayIf
+    NoImplicitPrelude
+    OverloadedStrings
+    PartialTypeSignatures
+    PatternSynonyms
+    TypeFamilies
+    ViewPatterns
+
+  ghc-options:
+    -Wall -Wcompat -Widentities -Wincomplete-record-updates
+    -Wincomplete-uni-patterns -Wredundant-constraints -Wunused-packages
+
+executable hydra-fuzzy
+  import:        project-config
+  hs-source-dirs: app src
+  main-is:       Main.hs
+  other-modules:
+    FuzzyActions
+    FuzzyReport
+
+  ghc-options:   -threaded -rtsopts
+  build-depends:
+    , aeson
+    , async
+    , base                  >=4.7 && <5
+    , cardano-api
+    , containers
+    , filepath
+    , http-conduit
+    , hydra-cardano-api
+    , hydra-cluster
+    , hydra-node
+    , hydra-prelude
+    , hydra-tx
+    , lens
+    , lens-aeson
+    , optparse-applicative
+    , random
+    , time
