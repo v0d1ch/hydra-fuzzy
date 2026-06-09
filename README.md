@@ -14,6 +14,18 @@ A running Hydra devnet with Alice, Bob, and Carol nodes. See the [Hydra demo](ht
 cabal build hydra-fuzzy
 ```
 
+Or with nix:
+
+```sh
+nix build .#hydra-fuzzy
+```
+
+A dev shell with GHC, cabal, and all native dependencies is available via:
+
+```sh
+nix develop
+```
+
 ## Run
 
 ```sh

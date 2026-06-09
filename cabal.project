@@ -19,13 +19,16 @@ packages: hydra-fuzzy.cabal
 source-repository-package
   type: git
   location: https://github.com/cardano-scaling/hydra
-  tag: d2a9b9355a39ef3bde2596d8f93d1ae6e6d5fd8e
+  tag: 6c503e77d0d21aa50c504d3d9b84a4fd7a22c590
   subdir:
     hydra-prelude
     hydra-cardano-api
     hydra-tx
     hydra-node
     hydra-cluster
+    hydra-plutus
+    hydra-plutus-extras
+    hydra-test-utils
 
 allow-newer:
   servant-multipart-client:random,
@@ -45,7 +48,13 @@ constraints:
   plutus-tx == 1.63.0.0,
   plutus-tx-plugin == 1.63.0.0,
   plutus-ledger-api == 1.63.0.0,
-  plutus-metatheory == 1.63.0.0
+  plutus-metatheory == 1.63.0.0,
+  any.cardano-api == 11.1.0.0,
+  any.cardano-binary == 1.7.3.0,
+  any.cardano-crypto-wrapper == 1.7.0.0,
+  any.cardano-ledger-core == 1.20.0.0,
+  any.cardano-ledger-shelley == 1.18.1.0,
+  any.ouroboros-consensus == 3.0.1.0
 
 package *
   ghc-options: -j8

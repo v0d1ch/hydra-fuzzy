@@ -16,6 +16,8 @@ data FailureType
   = StuckSnapshot {stuckSeconds :: Int}
   | UTxOMismatch
   | NodeCrash {crashReason :: String}
+  | L1ValueLoss {lovelaceLost :: Integer}
+  | FanoutFailed {fanoutError :: String}
   deriving stock (Show, Generic)
   deriving anyclass (ToJSON)
 
@@ -23,6 +25,8 @@ failureLabel :: FailureType -> String
 failureLabel (StuckSnapshot s) = "StuckSnapshot after " <> show s <> "s"
 failureLabel UTxOMismatch = "UTxOMismatch"
 failureLabel (NodeCrash r) = "NodeCrash: " <> r
+failureLabel (L1ValueLoss n) = "L1ValueLoss: " <> show n <> " lovelace"
+failureLabel (FanoutFailed e) = "FanoutFailed: " <> e
 
 data ActionTag
   = NewTxAction
@@ -66,6 +70,9 @@ data RoundStats = RoundStats
   , depositsExpired :: Int
   , decommitsFinalized :: Int
   , utxoCheckPassed :: Bool
+  , l1LovelaceBefore :: Integer
+  , l1LovelaceAfter :: Integer
+  , l1BalanceOk :: Bool
   , roundFailure :: Maybe FailureType
   }
 
@@ -84,6 +91,9 @@ emptyRoundStats n t =
     , depositsExpired = 0
     , decommitsFinalized = 0
     , utxoCheckPassed = False
+    , l1LovelaceBefore = 0
+    , l1LovelaceAfter = 0
+    , l1BalanceOk = False
     , roundFailure = Nothing
     }
 
@@ -163,6 +173,7 @@ renderReport RunConfig{cfgRounds, cfgTxsPerRound, cfgSeed, cfgStuckTimeout} stat
         , "  Deposits finalized: " <> show (depositsFinalized rs)
         , "  Deposits expired  : " <> show (depositsExpired rs)
         , "  Decommits finalized:" <> show (decommitsFinalized rs)
+        , "  L1 balance        : " <> renderL1Balance rs
         , ""
         ]
 
@@ -178,6 +189,23 @@ renderReport RunConfig{cfgRounds, cfgTxsPerRound, cfgSeed, cfgStuckTimeout} stat
           <> ", max "
           <> toMs (maximum lats)
           <> ")"
+
+  renderL1Balance :: RoundStats -> String
+  renderL1Balance rs
+    | l1LovelaceBefore rs == 0 = "not measured"
+    | otherwise =
+        let before = l1LovelaceBefore rs
+            after = l1LovelaceAfter rs
+            delta = after - before
+            deltaStr = (if delta >= 0 then "+" else "") <> show delta
+         in "before="
+              <> show before
+              <> " after="
+              <> show after
+              <> " delta="
+              <> deltaStr
+              <> " lovelace  "
+              <> (if l1BalanceOk rs then "OK" else "LOSS")
 
   renderOverall :: [RoundStats] -> [String]
   renderOverall ss =
