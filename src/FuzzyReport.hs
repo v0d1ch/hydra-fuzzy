@@ -38,6 +38,7 @@ data ActionTag
   | DrainAllAction
   | WaitExpireAction
   | CloseAction
+  | ForceCloseAction
   | ContestAction
   | FanoutAction
   deriving stock (Show, Eq, Ord, Generic, Enum, Bounded)
@@ -52,6 +53,7 @@ actionTagLabel = \case
   DrainAllAction -> "DrainAll"
   WaitExpireAction -> "WaitExpire"
   CloseAction -> "Close"
+  ForceCloseAction -> "ForceClose"
   ContestAction -> "Contest"
   FanoutAction -> "Fanout"
 
