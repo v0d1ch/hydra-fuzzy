@@ -28,7 +28,10 @@ import Options.Applicative (
  )
 
 main :: IO ()
-main = execParser optionsInfo >>= runFuzzy
+main = do
+  hSetBuffering stdout LineBuffering
+  hSetBuffering stderr LineBuffering
+  execParser optionsInfo >>= runFuzzy
 
 optionsInfo :: ParserInfo FuzzyOptions
 optionsInfo =
@@ -56,11 +59,11 @@ parseOptions = do
         <> metavar "N"
         <> value (fuzzyTxsPerRound defaultFuzzyOptions)
         <> showDefault
-        <> help "Max random actions in Open phase per round"
+        <> help "Max random actions in Open phase per round (sequential mode)"
   fuzzyStress <-
     switch $
       long "stress"
-        <> help "Enable stress mode: flood NewTx in Open phase"
+        <> help "Enable stress mode: expand UTxOs then flood NewTx for --flood-duration seconds"
   fuzzyParallelism <-
     option auto $
       long "parallelism"
@@ -69,6 +72,21 @@ parseOptions = do
         <> value (fuzzyParallelism defaultFuzzyOptions)
         <> showDefault
         <> help "Parallel sender threads in stress mode"
+  fuzzyFloodDuration <-
+    fmap (fromIntegral @Int) $
+      option auto $
+        long "flood-duration"
+          <> metavar "SECS"
+          <> value (floor (fuzzyFloodDuration defaultFuzzyOptions) :: Int)
+          <> showDefault
+          <> help "Seconds to flood txs per round in stress mode"
+  fuzzyExpandUtxo <-
+    option auto $
+      long "expand-utxo"
+        <> metavar "N"
+        <> value (fuzzyExpandUtxo defaultFuzzyOptions)
+        <> showDefault
+        <> help "Target UTxO count per party before stress flood (expansion phase)"
   fuzzyStuckTimeout <-
     fmap (fromIntegral @Int) $
       option auto $
@@ -134,6 +152,8 @@ parseOptions = do
       , fuzzyTxsPerRound
       , fuzzyStress
       , fuzzyParallelism
+      , fuzzyFloodDuration
+      , fuzzyExpandUtxo
       , fuzzyStuckTimeout
       , fuzzySeed
       , fuzzyOutputDir

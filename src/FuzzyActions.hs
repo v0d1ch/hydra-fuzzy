@@ -14,7 +14,7 @@ import Data.Aeson (Value, (.=))
 import Data.Aeson qualified as Aeson
 import Data.Aeson.Lens (key, _String)
 import Data.Char (toLower)
-import Data.List (isInfixOf, (!!))
+import Data.List (isInfixOf, maximumBy, minimumBy, minimum, (!!))
 import Data.Map.Strict qualified as Map
 import Data.Set qualified as Set
 import FuzzyReport
@@ -71,6 +71,8 @@ data FuzzyOptions = FuzzyOptions
   , fuzzyTxsPerRound :: Int
   , fuzzyStress :: Bool
   , fuzzyParallelism :: Int
+  , fuzzyFloodDuration :: NominalDiffTime
+  , fuzzyExpandUtxo :: Int
   , fuzzyStuckTimeout :: NominalDiffTime
   , fuzzySeed :: Int
   , fuzzyOutputDir :: FilePath
@@ -85,9 +87,11 @@ defaultFuzzyOptions :: FuzzyOptions
 defaultFuzzyOptions =
   FuzzyOptions
     { fuzzyRounds = 3
-    , fuzzyTxsPerRound = 50
+    , fuzzyTxsPerRound = 200
     , fuzzyStress = False
-    , fuzzyParallelism = 3
+    , fuzzyParallelism = 10
+    , fuzzyFloodDuration = 60
+    , fuzzyExpandUtxo = 6
     , fuzzyStuckTimeout = 30
     , fuzzySeed = 42
     , fuzzyOutputDir = "."
@@ -190,6 +194,7 @@ data RoundCtx = RoundCtx
   , ctxServerLogRef :: IORef [Value]
   , ctxLastSnapshotRef :: IORef UTCTime
   , ctxPendingTxRef :: IORef Int
+  , ctxPendingDepositsRef :: IORef Int
   , ctxRngRef :: IORef StdGen
   , ctxInFlightRef :: IORef (Set TxIn)
   }
@@ -201,6 +206,7 @@ newRoundCtx n now rngRef = do
   ctxServerLogRef <- newIORef []
   ctxLastSnapshotRef <- newIORef now
   ctxPendingTxRef <- newIORef 0
+  ctxPendingDepositsRef <- newIORef 0
   ctxInFlightRef <- newIORef mempty
   pure
     RoundCtx
@@ -209,6 +215,7 @@ newRoundCtx n now rngRef = do
       , ctxServerLogRef
       , ctxLastSnapshotRef
       , ctxPendingTxRef
+      , ctxPendingDepositsRef
       , ctxRngRef = rngRef
       , ctxInFlightRef
       }
@@ -264,11 +271,18 @@ runRound env opts roundNum rngRef = do
     Right () -> pure ()
     Left ex -> handleRoundFailure env opts ctx roundNum ex
 
+  -- Compute TPS: valid txs / round duration (roundEnd is the local binding above)
+  stats0 <- readIORef (ctxStatsRef ctx)
+  let dur = realToFrac (diffUTCTime roundEnd (roundStart stats0)) :: Double
+      tps = if dur > 0 then fromIntegral (txValidCount stats0) / dur else 0.0
+  modifyIORef' (ctxStatsRef ctx) $ \s -> s{roundThroughputTps = tps}
+
   readIORef (ctxStatsRef ctx)
 
 handleRoundFailure :: FuzzyEnv -> FuzzyOptions -> RoundCtx -> Int -> SomeException -> IO ()
 handleRoundFailure _env opts ctx roundNum ex = do
-  let failType = classifyException ex
+  let rawMsg = show ex
+      failType = classifyException rawMsg
   putStrLn $ "Round " <> show roundNum <> " FAILED: " <> failureLabel failType
   modifyIORef' (ctxStatsRef ctx) $ \s -> s{roundFailure = Just failType}
 
@@ -279,6 +293,7 @@ handleRoundFailure _env opts ctx roundNum ex = do
         FailureReport
           { frRound = roundNum
           , frFailureType = failType
+          , frRawException = rawMsg
           , frActionLog = actionLog
           , frServerOutputLog = serverLog
           , frPersistenceLogPaths =
@@ -291,10 +306,9 @@ handleRoundFailure _env opts ctx roundNum ex = do
   reportPath <- writeFailureReport (fuzzyOutputDir opts) fr
   putStrLn $ "Failure report: " <> reportPath
 
-classifyException :: SomeException -> FailureType
-classifyException ex =
-  let msg = show ex
-      msgLower = map toLower msg
+classifyException :: String -> FailureType
+classifyException msg =
+  let msgLower = map toLower msg
    in if "UTxOMismatch" `isInfixOf` msg
         then UTxOMismatch
         else
@@ -315,25 +329,29 @@ classifyException ex =
                             else
                               if any (`isInfixOf` msgLower) ["connection refused", "websocket", "socket does not exist"]
                                 then NodeCrash msg
-                                else StuckSnapshot 0
+                                else -- Unknown exception: preserve message for debugging
+                                  TransientError msg
  where
   parseStuck :: String -> FailureType
-  parseStuck msg =
-    let afterColon = drop 1 (dropWhile (/= ':') msg)
+  parseStuck m =
+    let afterColon = drop 1 (dropWhile (/= ':') m)
         secs = readMaybe (takeWhile (/= 's') afterColon) :: Maybe Int
      in StuckSnapshot (fromMaybe 0 secs)
 
   parseL1Loss :: String -> FailureType
-  parseL1Loss msg =
-    let afterColon = drop 1 (dropWhile (/= ':') msg)
+  parseL1Loss m =
+    let afterColon = drop 1 (dropWhile (/= ':') m)
         n = readMaybe (takeWhile (/= ' ') afterColon) :: Maybe Integer
      in L1ValueLoss (fromMaybe 0 n)
 
   parseWaitMatchTimeout :: String -> FailureType
-  parseWaitMatchTimeout msg =
-    -- "waitMatch did not match a message within N.Xs"
-    let afterWithin = drop 1 (dropWhile (/= 'n') (dropWhile (/= 'i') msg))
-        secs = readMaybe (takeWhile (\c -> c == '.' || c >= '0' && c <= '9') afterWithin) :: Maybe Double
+  parseWaitMatchTimeout m =
+    let findAfter [] = []
+        findAfter s@(_ : rest)
+          | "within " `isPrefixOf` s = drop 7 s
+          | otherwise = findAfter rest
+        timeStr = findAfter m
+        secs = readMaybe (takeWhile (\c -> c == '.' || (c >= '0' && c <= '9')) timeStr) :: Maybe Double
      in StuckSnapshot (maybe 0 round secs)
 
 -- * Logging helpers
@@ -367,10 +385,12 @@ logEvent ctx v = do
           }
       modifyIORef' (ctxPendingTxRef ctx) $ \n -> max 0 (n - 1)
       writeIORef (ctxInFlightRef ctx) mempty
-    Just "CommitFinalized" ->
+    Just "CommitFinalized" -> do
       modifyIORef' (ctxStatsRef ctx) $ \s -> s{depositsFinalized = depositsFinalized s + 1}
-    Just "DepositExpired" ->
+      modifyIORef' (ctxPendingDepositsRef ctx) $ \n -> max 0 (n - 1)
+    Just "DepositExpired" -> do
       modifyIORef' (ctxStatsRef ctx) $ \s -> s{depositsExpired = depositsExpired s + 1}
+      modifyIORef' (ctxPendingDepositsRef ctx) $ \n -> max 0 (n - 1)
     Just "DecommitFinalized" ->
       modifyIORef' (ctxStatsRef ctx) $ \s -> s{decommitsFinalized = decommitsFinalized s + 1}
     _ -> pure ()
@@ -422,19 +442,6 @@ waitForOpen client ctx = do
   collectUntilOpen client ctx 0
   putStrLn "HeadIsOpen!"
 
-commitParty :: FuzzyEnv -> FuzzyParty -> IO ()
-commitParty env party = do
-  let connectInfo = localNodeConnectInfo demoNetworkId (nodeSocket (envDirectOpts env))
-  l1Utxo <- queryUTxOFor connectInfo QueryTip (fundsVkFor env party)
-  if UTxO.null l1Utxo
-    then putStrLn $ "  " <> show party <> ": no L1 UTxO, skipping commit"
-    else do
-      commitTx <-
-        requestCommitTx (clientFor env party) l1Utxo
-          <&> \tx -> withSecret (fundsSkFor env party) (`signTx` tx)
-      runDirectBackend (envDirectOpts env) (submitTransaction commitTx)
-      putStrLn $ "  " <> show party <> " commit submitted."
-
 collectUntilOpen :: HydraClient -> RoundCtx -> Int -> IO ()
 collectUntilOpen client ctx n = do
   v <- waitMatch 120 client $ \v ->
@@ -452,14 +459,16 @@ collectUntilOpen client ctx n = do
 
 -- * Open phase
 
--- | Action weights: (action, weight)
+-- | Action weights for sequential (non-stress) mode.
 actionWeights :: [(ActionTag, Int)]
 actionWeights =
-  [ (NewTxAction, 65)
-  , (DepositAction, 15)
+  [ (NewTxAction, 42)
+  , (MultiSendAction, 18)
+  , (DepositAction, 12)
   , (DecommitAction, 10)
+  , (DrainAllAction, 3)
   , (WaitExpireAction, 5)
-  , (CloseAction, 5)
+  , (CloseAction, 10)
   ]
 
 totalWeight :: Int
@@ -491,17 +500,21 @@ openPhase env opts ctx = do
   seedL2 env ctx
   if fuzzyStress opts
     then do
-      putStrLn $ "Stress mode: " <> show (fuzzyParallelism opts) <> " parallel senders, " <> show (fuzzyTxsPerRound opts) <> " txs each..."
-      forConcurrently_ [1 .. fuzzyParallelism opts] $ \_ ->
-        replicateM_ (fuzzyTxsPerRound opts) (sendNewTx env ctx)
-      drainEvents 30 env ctx
+      -- Phase 1: fan out UTxOs so parallel senders have many inputs
+      putStrLn $ "Stress mode: expanding UTxO set (target " <> show (fuzzyExpandUtxo opts) <> " per party)..."
+      expandUtxo env opts ctx
+      -- Phase 2: flood for configured duration
+      let secs = floor (fuzzyFloodDuration opts) :: Int
+      putStrLn $ "Stress mode: flooding " <> show secs <> "s \xd7 " <> show (fuzzyParallelism opts) <> " senders..."
+      floodForDuration opts env ctx
+      drainEvents 60 env ctx
+      -- Phase 3: exercise decommits
       putStrLn "Stress mode: exercising decommits..."
-      replicateM_ (fuzzyParallelism opts) (doDecommit env ctx opts)
-      drainEvents 15 env ctx
+      replicateM_ (fuzzyParallelism opts `div` 2 + 1) (doDecommit env ctx opts)
+      drainEvents 20 env ctx
     else go 0 (fuzzyTxsPerRound opts)
   getSnapshotUTxO (envAliceClient env)
  where
-  -- Don't allow Close until at least this many actions have run
   minBeforeClose = max 20 (fuzzyTxsPerRound opts * 2 `div` 3)
 
   go :: Int -> Int -> IO ()
@@ -511,9 +524,7 @@ openPhase env opts ctx = do
     action <- pickWeightedAction (ctxRngRef ctx)
     case action of
       CloseAction
-        | done < minBeforeClose ->
-            -- Too early for Close; skip this pick and try again
-            go done remaining
+        | done < minBeforeClose -> go done remaining
       CloseAction -> putStrLn "Picked Close, ending open phase."
       _ -> do
         executeAction env ctx opts action
@@ -523,14 +534,115 @@ openPhase env opts ctx = do
 executeAction :: FuzzyEnv -> RoundCtx -> FuzzyOptions -> ActionTag -> IO ()
 executeAction env ctx opts = \case
   NewTxAction -> doNewTx env ctx opts
+  MultiSendAction -> doMultiSend env ctx opts
   DepositAction -> doDeposit env ctx
   DecommitAction -> doDecommit env ctx opts
+  DrainAllAction -> doDrainAll env ctx opts
   WaitExpireAction -> doWaitExpire env ctx opts
   _ -> pure ()
 
--- | Fire-and-forget variant used in stress mode: only sends, no WebSocket reads.
--- Atomically claims a TxIn from the snapshot before sending so concurrent
--- threads do not double-spend the same input.
+-- * UTxO expansion (stress mode pre-flood)
+
+-- | Fan out UTxOs so every party reaches the target count.
+-- Picks the richest party as sender and the poorest as recipient to balance
+-- the UTxO distribution evenly. Waits for SnapshotConfirmed each iteration.
+expandUtxo :: FuzzyEnv -> FuzzyOptions -> RoundCtx -> IO ()
+expandUtxo env opts ctx = go (0 :: Int)
+ where
+  target = fuzzyExpandUtxo opts
+  maxIter = target * 9
+
+  parties :: [FuzzyParty]
+  parties = [FuzzyAlice, FuzzyBob, FuzzyCarol]
+
+  utxoCountFor :: UTxO -> FuzzyParty -> Int
+  utxoCountFor utxo party =
+    length
+      [ ()
+      | (_, txOut) <- UTxO.toList utxo
+      , txOutAddress txOut == mkVkAddress demoNetworkId (fundsVkFor env party)
+      ]
+
+  go n = do
+    l2Utxo <- getSnapshotUTxO (envAliceClient env)
+    let withCounts = [(utxoCountFor l2Utxo p, p) | p <- parties]
+        counts = map fst withCounts
+        minC = minimum counts
+    if minC >= target || n >= maxIter
+      then
+        putStrLn $
+          "  Expand done: "
+            <> intercalate "/" (map show counts)
+            <> " UTxOs (Alice/Bob/Carol)"
+      else do
+        -- Send from richest → poorest to spread UTxOs evenly
+        let richest = snd $ maximumBy (\(a, _) (b, _) -> compare a b) withCounts
+            poorest = snd $ minimumBy (\(a, _) (b, _) -> compare a b) withCounts
+            -- If they're the same party, fall back to nextParty
+            recipient = if richest == poorest then nextParty richest else poorest
+        -- Find a splittable UTxO owned by the richest party
+        let richAddr = mkVkAddress demoNetworkId (fundsVkFor env richest)
+            splittable =
+              [ (txIn, txOut)
+              | (txIn, txOut) <- UTxO.toList l2Utxo
+              , txOutAddress txOut == richAddr
+              , selectLovelace (txOutValue txOut) > 4_000_000
+              ]
+        case splittable of
+          [] -> do
+            -- Richest has nothing big enough; try anyone via claimUtxo
+            claimUtxo env ctx l2Utxo >>= \case
+              Nothing -> putStrLn "  Expand: nothing claimable, stopping"
+              Just (party, txIn, txOut) -> do
+                atomicModifyIORef' (ctxInFlightRef ctx) (\s -> (Set.delete txIn s, ()))
+                go (n + 1)
+          (txIn, txOut) : _ -> do
+            mClaimed <- atomicModifyIORef' (ctxInFlightRef ctx) $ \inFlight ->
+              if txIn `Set.member` inFlight
+                then (inFlight, Nothing)
+                else (Set.insert txIn inFlight, Just (txIn, txOut))
+            case mClaimed of
+              Nothing -> go (n + 1)
+              Just (claimedIn, claimedOut) -> do
+                let totalLovelace = selectLovelace (txOutValue claimedOut)
+                    recipientAddr = mkVkAddress demoNetworkId (fundsVkFor env recipient)
+                    sendVal = lovelaceToValue (totalLovelace `div` 2)
+                case mkSimpleTx (claimedIn, claimedOut) (recipientAddr, sendVal) (fundsSkFor env richest) of
+                  Left err -> do
+                    putStrLn $ "  Expand: build failed: " <> show err
+                    atomicModifyIORef' (ctxInFlightRef ctx) (\s -> (Set.delete claimedIn s, ()))
+                    go (n + 1)
+                  Right tx -> do
+                    send (clientFor env richest) (input "NewTx" ["transaction" .= Aeson.toJSON tx])
+                    logAction ctx richest NewTxAction
+                    modifyIORef' (ctxPendingTxRef ctx) (+ 1)
+                    sv <- waitMatch (fuzzyStuckTimeout opts) (envAliceClient env) $ \msg ->
+                      msg ^? key "tag" . _String >>= \case
+                        "SnapshotConfirmed" -> Just msg
+                        _ -> Nothing
+                    logEvent ctx sv
+                    go (n + 1)
+
+-- | Time-bounded tx flood: N threads, each sending as fast as possible.
+-- Records flood-window peak TPS into ctxStatsRef.
+floodForDuration :: FuzzyOptions -> FuzzyEnv -> RoundCtx -> IO ()
+floodForDuration opts env ctx = do
+  floodStart <- getCurrentTime
+  txBefore <- txValidCount <$> readIORef (ctxStatsRef ctx)
+  forConcurrently_ [1 .. fuzzyParallelism opts] $ \_ ->
+    let loop = do
+          now <- getCurrentTime
+          when (diffUTCTime now floodStart < fuzzyFloodDuration opts) $
+            sendNewTx env ctx >> loop
+     in loop
+  floodEnd <- getCurrentTime
+  txAfter <- txValidCount <$> readIORef (ctxStatsRef ctx)
+  let floodDur = realToFrac (diffUTCTime floodEnd floodStart) :: Double
+      peakTps = if floodDur > 0 then fromIntegral (txAfter - txBefore) / floodDur else 0.0
+  modifyIORef' (ctxStatsRef ctx) $ \s -> s{floodPeakTps = peakTps}
+
+-- | Fire-and-forget variant: claim a UTxO, send it, increment pending counter.
+-- Concurrent threads use ctxInFlightRef to avoid double-spending.
 sendNewTx :: FuzzyEnv -> RoundCtx -> IO ()
 sendNewTx env ctx = do
   l2Utxo <- getSnapshotUTxO (envAliceClient env)
@@ -564,6 +676,7 @@ sendNewTx env ctx = do
           logAction ctx party NewTxAction
           modifyIORef' (ctxPendingTxRef ctx) (+ 1)
 
+-- | Sequential NewTx with explicit SnapshotConfirmed wait (used in sequential mode).
 doNewTx :: FuzzyEnv -> RoundCtx -> FuzzyOptions -> IO ()
 doNewTx env ctx opts = do
   l2Utxo <- getSnapshotUTxO (envAliceClient env)
@@ -573,9 +686,8 @@ doNewTx env ctx opts = do
       doDeposit env ctx
     Just (party, txIn, txOut) -> do
       let recipient = nextParty party
-      let recipientAddr = mkVkAddress demoNetworkId (fundsVkFor env recipient)
-      -- Split: send half to recipient, keep half as change (enables parallel spending)
-      let totalLovelace = selectLovelace (txOutValue txOut)
+          recipientAddr = mkVkAddress demoNetworkId (fundsVkFor env recipient)
+          totalLovelace = selectLovelace (txOutValue txOut)
           minUTxO = 2_000_000
           sendValue =
             if totalLovelace > 2 * minUTxO
@@ -587,7 +699,7 @@ doNewTx env ctx opts = do
           send (clientFor env party) (input "NewTx" ["transaction" .= Aeson.toJSON tx])
           logAction ctx party NewTxAction
           modifyIORef' (ctxPendingTxRef ctx) (+ 1)
-          putStrLn $ "  NewTx sent (" <> show party <> " → " <> show recipient <> " " <> show (selectLovelace sendValue) <> " lovelace), awaiting TxValid..."
+          putStrLn $ "  NewTx sent (" <> show party <> " \x2192 " <> show recipient <> " " <> show (selectLovelace sendValue) <> " lovelace), awaiting TxValid..."
           outcome <- waitMatch 30 (envAliceClient env) $ \v ->
             v
               ^? key "tag" . _String >>= \case
@@ -601,7 +713,7 @@ doNewTx env ctx opts = do
               putStrLn "  NewTx: rejected (TxInvalid)"
             Right v -> do
               logEvent ctx v
-              putStrLn "  NewTx: accepted — awaiting SnapshotConfirmed..."
+              putStrLn "  NewTx: accepted \x2014 awaiting SnapshotConfirmed..."
               sv <- waitMatch (fuzzyStuckTimeout opts) (envAliceClient env) $ \msg ->
                 msg
                   ^? key "tag" . _String >>= \case
@@ -610,12 +722,34 @@ doNewTx env ctx opts = do
               logEvent ctx sv
               putStrLn "  NewTx: confirmed in snapshot"
 
--- | Ensure L2 has spendable UTxO before the action loop starts.
--- If funds already exist on L2, skips deposits entirely.
--- If L2 is empty, submits deposits for all parties with L1 funds in parallel,
--- then returns as soon as the FIRST CommitFinalized arrives so the action loop
--- can begin immediately. Remaining CommitFinalized events are drained naturally
--- by the action loop's drainEvents calls.
+-- | Burst: fire N txs rapid-fire (fire-and-forget each), then let event drain collect them.
+doMultiSend :: FuzzyEnv -> RoundCtx -> FuzzyOptions -> IO ()
+doMultiSend env ctx opts = do
+  let burstSize = 5 :: Int
+  putStrLn $ "  MultiSend: firing " <> show burstSize <> " txs rapid-fire..."
+  logAction ctx FuzzyAlice MultiSendAction
+  replicateM_ burstSize (sendNewTx env ctx)
+  -- Collect confirmations immediately so pending count doesn't inflate
+  drainEvents (min 20 (fuzzyStuckTimeout opts)) env ctx
+  pending <- readIORef (ctxPendingTxRef ctx)
+  putStrLn $ "  MultiSend: done (" <> show pending <> " still pending)"
+
+-- | Retry an IO action on HTTP/connection exceptions with fixed backoff.
+retryOnHttpError :: Int -> IO a -> IO a
+retryOnHttpError 0 act = act
+retryOnHttpError n act =
+  act `catch` \(ex :: SomeException) ->
+    if isHttpErr (show ex)
+      then threadDelay 500_000 >> retryOnHttpError (n - 1) act
+      else throwIO ex
+ where
+  isHttpErr msg =
+    any
+      (`isInfixOf` map toLower msg)
+      ["httpexception", "connection refused", "vanillahttpexception", "network.socket"]
+
+-- | Seed L2 with deposits from all parties that have L1 funds.
+-- Returns as soon as the first CommitFinalized arrives.
 seedL2 :: FuzzyEnv -> RoundCtx -> IO ()
 seedL2 env ctx = do
   l2Utxo <- getSnapshotUTxO (envAliceClient env)
@@ -627,23 +761,24 @@ seedL2 env ctx = do
         l1Utxo <- queryUTxOFor connectInfo QueryTip (fundsVkFor env party)
         pure (party, l1Utxo)
       let withFunds = filter (not . UTxO.null . snd) partyFunds
-      if null withFunds
-        then putStrLn "  Seed: no parties have L1 funds, skipping"
-        else do
-          forConcurrently_ withFunds $ \(party, l1Utxo) -> do
-            commitTx <-
-              requestCommitTx (clientFor env party) l1Utxo
-                <&> \tx -> withSecret (fundsSkFor env party) (`signTx` tx)
-            runDirectBackend (envDirectOpts env) (submitTransaction commitTx)
-            logAction ctx party DepositAction
-            putStrLn $ "  Seed deposit submitted (" <> show party <> ")"
-          putStrLn $ "  Waiting for first CommitFinalized (of " <> show (length withFunds) <> " submitted)..."
+      -- Only deposit for Alice to avoid concurrent collectCom PostTxOnChainFailed races.
+      -- expandUtxo will spread funds to Bob/Carol via L2 transactions.
+      case find (\(p, _) -> p == FuzzyAlice) withFunds of
+        Nothing -> putStrLn "  Seed: no parties have L1 funds, skipping"
+        Just (_, aliceL1Utxo) -> do
+          commitTx <- retryOnHttpError 5 $
+            requestCommitTx (clientFor env FuzzyAlice) aliceL1Utxo
+              <&> \tx -> withSecret (fundsSkFor env FuzzyAlice) (`signTx` tx)
+          runDirectBackend (envDirectOpts env) (submitTransaction commitTx)
+          logAction ctx FuzzyAlice DepositAction
+          modifyIORef' (ctxPendingDepositsRef ctx) (+ 1)
+          putStrLn "  Seed deposit submitted (FuzzyAlice), waiting for CommitFinalized..."
           v <- waitMatch 120 (envAliceClient env) $ \msg ->
             msg ^? key "tag" . _String >>= \case
               "CommitFinalized" -> Just msg
               _ -> Nothing
           logEvent ctx v
-          putStrLn "  First deposit confirmed — L2 funded, remaining deposits will arrive asynchronously"
+          putStrLn "  Seed deposit confirmed \x2014 L2 funded"
 
 doDeposit :: FuzzyEnv -> RoundCtx -> IO ()
 doDeposit env ctx = do
@@ -658,6 +793,7 @@ doDeposit env ctx = do
           <&> \tx -> withSecret (fundsSkFor env party) (`signTx` tx)
       runDirectBackend (envDirectOpts env) (submitTransaction commitTx)
       logAction ctx party DepositAction
+      modifyIORef' (ctxPendingDepositsRef ctx) (+ 1)
       putStrLn $ "  Deposit submitted (" <> show party <> "), continuing without waiting for CommitFinalized"
 
 doWaitExpire :: FuzzyEnv -> RoundCtx -> FuzzyOptions -> IO ()
@@ -674,6 +810,7 @@ doWaitExpire env ctx opts = do
       let depositId = getTxId (getTxBody commitTx)
       runDirectBackend (envDirectOpts env) (submitTransaction commitTx)
       logAction ctx party WaitExpireAction
+      modifyIORef' (ctxPendingDepositsRef ctx) (+ 1)
       putStrLn $ "  WaitExpire: deposit submitted, waiting ~" <> show (floor (fuzzyDepositExpireWait opts) :: Int) <> "s for expiry..."
       outcome <- waitMatch (fuzzyDepositExpireWait opts + 30) (envAliceClient env) $ \msg ->
         msg
@@ -697,7 +834,10 @@ doWaitExpire env ctx opts = do
 doDecommit :: FuzzyEnv -> RoundCtx -> FuzzyOptions -> IO ()
 doDecommit env ctx opts = do
   l2Utxo <- getSnapshotUTxO (envAliceClient env)
-  claimUtxo env ctx l2Utxo >>= \case
+  -- Rotate the party order each call so decommits spread across parties
+  startParty <- pickRandom (ctxRngRef ctx) [FuzzyAlice, FuzzyBob, FuzzyCarol]
+  let rotatedParties = take 3 $ dropWhile (/= startParty) (cycle [FuzzyAlice, FuzzyBob, FuzzyCarol])
+  claimUtxoFrom env ctx l2Utxo rotatedParties >>= \case
     Nothing -> putStrLn "  Decommit: no spendable L2 UTxO, skipping"
     Just (party, _txIn, txOut) -> do
       let selfAddr = mkVkAddress demoNetworkId (fundsVkFor env party)
@@ -716,17 +856,25 @@ doDecommit env ctx opts = do
           logEvent ctx v
           putStrLn "  Decommit finalized"
 
--- | Atomically claim a spendable UTxO not already in-flight.
--- Returns Nothing if all spendable inputs are already claimed.
+-- | Atomically claim a spendable UTxO not already in-flight (Alice-first order).
 claimUtxo ::
   FuzzyEnv ->
   RoundCtx ->
   UTxO ->
   IO (Maybe (FuzzyParty, TxIn, TxOut CAPI.CtxUTxO))
-claimUtxo env ctx utxo = do
+claimUtxo env ctx utxo = claimUtxoFrom env ctx utxo [FuzzyAlice, FuzzyBob, FuzzyCarol]
+
+-- | Like 'claimUtxo' but tries parties in the given order.
+claimUtxoFrom ::
+  FuzzyEnv ->
+  RoundCtx ->
+  UTxO ->
+  [FuzzyParty] ->
+  IO (Maybe (FuzzyParty, TxIn, TxOut CAPI.CtxUTxO))
+claimUtxoFrom env ctx utxo parties = do
   let candidates =
         [ (party, txIn, txOut)
-        | party <- [FuzzyAlice, FuzzyBob, FuzzyCarol]
+        | party <- parties
         , let addr = mkVkAddress demoNetworkId (fundsVkFor env party)
         , (txIn, txOut) <- UTxO.toList utxo
         , txOutAddress txOut == addr
@@ -737,7 +885,6 @@ claimUtxo env ctx utxo = do
       [] -> (inFlight, Nothing)
       (party, txIn, txOut) : _ -> (Set.insert txIn inFlight, Just (party, txIn, txOut))
 
--- | Find a UTxO in the snapshot owned by one of the parties with enough lovelace.
 findSpendableUtxo ::
   FuzzyEnv ->
   UTxO ->
@@ -757,6 +904,34 @@ nextParty FuzzyAlice = FuzzyBob
 nextParty FuzzyBob = FuzzyCarol
 nextParty FuzzyCarol = FuzzyAlice
 
+-- | Decommit all spendable L2 UTxOs sequentially until the head is empty.
+doDrainAll :: FuzzyEnv -> RoundCtx -> FuzzyOptions -> IO ()
+doDrainAll env ctx opts = do
+  writeIORef (ctxInFlightRef ctx) mempty
+  putStrLn "  DrainAll: draining all L2 UTxOs..."
+  go (0 :: Int)
+ where
+  go count = do
+    l2Utxo <- getSnapshotUTxO (envAliceClient env)
+    claimUtxo env ctx l2Utxo >>= \case
+      Nothing -> putStrLn $ "  DrainAll: done, decommitted " <> show count <> " UTxO(s)"
+      Just (party, txIn, txOut) -> do
+        let selfAddr = mkVkAddress demoNetworkId (fundsVkFor env party)
+        case mkSimpleTx (txIn, txOut) (selfAddr, txOutValue txOut) (fundsSkFor env party) of
+          Left err -> do
+            atomicModifyIORef' (ctxInFlightRef ctx) (\s -> (Set.delete txIn s, ()))
+            putStrLn $ "  DrainAll: build failed: " <> show err
+          Right tx -> do
+            postDecommit (clientFor env party) tx
+            logAction ctx party DecommitAction
+            putStrLn $ "  DrainAll: decommit " <> show (count + 1) <> " submitted (" <> show party <> ")..."
+            v <- waitMatch (fuzzyStuckTimeout opts + 60) (envAliceClient env) $ \msg ->
+              msg ^? key "tag" . _String >>= \case
+                "DecommitFinalized" -> Just msg
+                _ -> Nothing
+            logEvent ctx v
+            go (count + 1)
+
 -- | Sum of all lovelace owned by the three fuzzy parties on L1.
 totalL1Lovelace :: FuzzyEnv -> IO Integer
 totalL1Lovelace env = do
@@ -773,7 +948,7 @@ closePhase env opts ctx = do
   putStrLn "Close phase: sending Close..."
   sendCloseAndWait env ctx 5
 
-  -- 30% chance to Contest from Bob or Carol
+  -- 30% chance to contest from Bob or Carol, with cascade
   rng <- readIORef (ctxRngRef ctx)
   let (n, rng') = randomR (0 :: Int, 9) rng
   writeIORef (ctxRngRef ctx) rng'
@@ -783,8 +958,16 @@ closePhase env opts ctx = do
     send (clientFor env contestant) (input "Contest" [])
     logAction ctx contestant ContestAction
     drainEvents 5 env ctx
+    rng2 <- readIORef (ctxRngRef ctx)
+    let (n2, rng2') = randomR (0 :: Int, 9) rng2
+    writeIORef (ctxRngRef ctx) rng2'
+    when (n2 < 3) $ do
+      let other = if contestant == FuzzyBob then FuzzyCarol else FuzzyBob
+      putStrLn $ "Cascade contest from " <> show other <> "..."
+      send (clientFor env other) (input "Contest" [])
+      logAction ctx other ContestAction
+      drainEvents 5 env ctx
 
-  -- Wait for ReadyToFanout (contestation period + buffer)
   let waitBudget = 120 + floor (fuzzyStuckTimeout opts) :: Int
   putStrLn $ "Waiting for ReadyToFanout (up to " <> show waitBudget <> "s)..."
   _ <- waitMatch (fromIntegral waitBudget) (envAliceClient env) $ \v ->
@@ -795,52 +978,38 @@ sendCloseAndWait :: FuzzyEnv -> RoundCtx -> Int -> IO ()
 sendCloseAndWait env ctx retriesLeft = do
   send (envAliceClient env) (input "Close" [])
   logAction ctx FuzzyAlice CloseAction
-  outcome <-
-    waitMatch 120 (envAliceClient env) $ \v ->
-      case v ^? key "tag" . _String of
-        Just "HeadIsClosed" -> Just (Right ())
-        Just "PostTxOnChainFailed" -> Just (Left (v ^? key "postTxError" . _String))
-        _ -> Nothing
-  case outcome of
+  result <- try (waitMatch 120 (envAliceClient env) $ \v ->
+    guard (v ^? key "tag" . _String == Just "HeadIsClosed") $> ()) :: IO (Either SomeException ())
+  case result of
     Right () -> putStrLn "HeadIsClosed."
-    Left mbErr
+    Left _
       | retriesLeft > 0 -> do
-          putStrLn $
-            "Close tx failed ("
-              <> maybe "unknown error" toString mbErr
-              <> "), retrying in 5s ("
-              <> show retriesLeft
-              <> " retries left)..."
+          putStrLn $ "Close not confirmed in 120s, retrying (" <> show retriesLeft <> " retries left)..."
           threadDelay 5_000_000
           sendCloseAndWait env ctx (retriesLeft - 1)
       | otherwise ->
-          throwIO $
-            ErrorCall $
-              "Close tx failed after all retries: "
-                <> maybe "unknown error" toString mbErr
+          throwIO $ ErrorCall "Close tx failed after all retries"
 
 -- * Fanout phase
 
 -- | Maximum lovelace loss attributable to L1 fees across a full round.
--- Generous enough to cover: deposits × N + close + contest + fanout @ ~0.5 ADA each.
 maxFeeLoss :: Integer
 maxFeeLoss = 10_000_000
 
 fanoutPhase :: FuzzyEnv -> UTxO -> RoundCtx -> IO ()
 fanoutPhase env snapshotUtxo ctx = do
   let snapshotLovelace = UTxO.totalLovelace snapshotUtxo
-  sendFanoutAndWait env ctx 10
+  sendFanoutAndWait env ctx 3
 
-  -- NOTE: HeadIsFinalized.finalizedUTxO is a Set in Hydra's API, which
-  -- deduplicates identical outputs. We log snapshot lovelace for reference
-  -- but do not compare against finalizedUTxO sum (false positives).
   modifyIORef' (ctxStatsRef ctx) $ \s -> s{utxoCheckPassed = True}
   putStrLn $ "Fanout complete (last snapshot had " <> show snapshotLovelace <> " lovelace)"
 
-  -- L1 balance conservation check
   stats <- readIORef (ctxStatsRef ctx)
   let l1Before = l1LovelaceBefore stats
-  when (l1Before > 0) $ do
+  pending <- readIORef (ctxPendingDepositsRef ctx)
+  when (l1Before > 0 && pending > 0) $
+    putStrLn $ "  L1 balance check skipped (" <> show pending <> " deposit(s) still pending in deposit contract)"
+  when (l1Before > 0 && pending == 0) $ do
     l1After <- totalL1Lovelace env
     let loss = l1Before - l1After
         balanceOk = loss <= maxFeeLoss
@@ -858,26 +1027,34 @@ fanoutPhase env snapshotUtxo ctx = do
 
 sendFanoutAndWait :: FuzzyEnv -> RoundCtx -> Int -> IO ()
 sendFanoutAndWait env ctx retriesLeft = do
+  when (retriesLeft == 3) $ logAction ctx FuzzyAlice FanoutAction
   send (envAliceClient env) (input "Fanout" [])
-  logAction ctx FuzzyAlice FanoutAction
-  outcome <- waitMatch 120 (envAliceClient env) $ \v ->
-    case v ^? key "tag" . _String of
-      Just "HeadIsFinalized" -> Just (Right ())
-      Just "PostTxOnChainFailed" -> Just (Left (v ^? key "postTxError" . _String))
-      _ -> Nothing
-  case outcome of
-    Right () -> putStrLn "HeadIsFinalized."
-    Left mbErr
-      | retriesLeft > 0 -> do
-          putStrLn $
-            "Fanout tx failed ("
-              <> maybe "unknown error" toString mbErr
-              <> "), retrying in 5s ("
-              <> show retriesLeft
-              <> " retries left)..."
-          threadDelay 5_000_000
+  deadline <- addUTCTime 60 <$> getCurrentTime
+  finalized <- pollUntilFinalized deadline
+  if finalized
+    then putStrLn "HeadIsFinalized."
+    else
+      if retriesLeft > 0
+        then do
+          putStrLn $ "Fanout not confirmed in 60s, retrying (" <> show retriesLeft <> " left)..."
           sendFanoutAndWait env ctx (retriesLeft - 1)
-      | otherwise ->
-          throwIO $
-            ErrorCall $
-              "FanoutFailed:" <> maybe "unknown error" toString mbErr
+        else throwIO $ ErrorCall "FanoutFailed: not confirmed after all retries"
+ where
+  pollUntilFinalized :: UTCTime -> IO Bool
+  pollUntilFinalized deadline = do
+    now <- getCurrentTime
+    let remaining = diffUTCTime deadline now
+    if remaining <= 0
+      then pure False
+      else
+        tryGetEvent (min remaining 5.0) (envAliceClient env) >>= \case
+          Nothing -> pollUntilFinalized deadline
+          Just v -> do
+            logEvent ctx v
+            case v ^? key "tag" . _String of
+              Just "HeadIsFinalized" -> pure True
+              Just "PostTxOnChainFailed" -> do
+                let err = show <$> (v ^? key "postTxError" :: Maybe Value)
+                putStrLn $ "  Fanout: on-chain tx failed: " <> fromMaybe "?" err
+                pollUntilFinalized deadline
+              _ -> pollUntilFinalized deadline

@@ -46,8 +46,8 @@
           inputMap."https://intersectmbo.github.io/cardano-haskell-packages" = CHaP;
           compiler-nix-name = "ghc967";
           sha256map = {
-            "https://github.com/cardano-scaling/hydra"."6c503e77d0d21aa50c504d3d9b84a4fd7a22c590" =
-              "sha256-UV3wHPY9AdE/y7mbHUk1lTjFvrE2Qp76T05gGuQUjZU=";
+            "https://github.com/cardano-scaling/hydra"."03b2c7c82662b00525b32c8073c24cf74b37289d" =
+              "sha256-dXaOeZoYiKZKOTmYUllNGtFfEWzddkiXfKwzobMYvwg=";
           };
           modules = [
             { reinstallableLibGhc = false; }

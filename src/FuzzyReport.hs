@@ -18,6 +18,7 @@ data FailureType
   | NodeCrash {crashReason :: String}
   | L1ValueLoss {lovelaceLost :: Integer}
   | FanoutFailed {fanoutError :: String}
+  | TransientError {transientReason :: String}
   deriving stock (Show, Generic)
   deriving anyclass (ToJSON)
 
@@ -27,11 +28,14 @@ failureLabel UTxOMismatch = "UTxOMismatch"
 failureLabel (NodeCrash r) = "NodeCrash: " <> r
 failureLabel (L1ValueLoss n) = "L1ValueLoss: " <> show n <> " lovelace"
 failureLabel (FanoutFailed e) = "FanoutFailed: " <> e
+failureLabel (TransientError r) = "TransientError: " <> take 120 r
 
 data ActionTag
   = NewTxAction
+  | MultiSendAction
   | DepositAction
   | DecommitAction
+  | DrainAllAction
   | WaitExpireAction
   | CloseAction
   | ContestAction
@@ -42,8 +46,10 @@ data ActionTag
 actionTagLabel :: ActionTag -> String
 actionTagLabel = \case
   NewTxAction -> "NewTx"
+  MultiSendAction -> "MultiSend"
   DepositAction -> "Deposit"
   DecommitAction -> "Decommit"
+  DrainAllAction -> "DrainAll"
   WaitExpireAction -> "WaitExpire"
   CloseAction -> "Close"
   ContestAction -> "Contest"
@@ -74,6 +80,8 @@ data RoundStats = RoundStats
   , l1LovelaceAfter :: Integer
   , l1BalanceOk :: Bool
   , roundFailure :: Maybe FailureType
+  , roundThroughputTps :: Double
+  , floodPeakTps :: Double
   }
 
 emptyRoundStats :: Int -> UTCTime -> RoundStats
@@ -95,6 +103,8 @@ emptyRoundStats n t =
     , l1LovelaceAfter = 0
     , l1BalanceOk = False
     , roundFailure = Nothing
+    , roundThroughputTps = 0.0
+    , floodPeakTps = 0.0
     }
 
 data RunConfig = RunConfig
@@ -107,6 +117,7 @@ data RunConfig = RunConfig
 data FailureReport = FailureReport
   { frRound :: Int
   , frFailureType :: FailureType
+  , frRawException :: String
   , frActionLog :: [ActionEntry]
   , frServerOutputLog :: [Value]
   , frPersistenceLogPaths :: Map Text FilePath
@@ -132,7 +143,7 @@ renderReport RunConfig{cfgRounds, cfgTxsPerRound, cfgSeed, cfgStuckTimeout} stat
  where
   header :: [String]
   header =
-    [ "hydra-fuzzy run report — " <> maybe "n/a" (formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ" . roundStart) (listToMaybe stats)
+    [ "hydra-fuzzy run report \x2014 " <> maybe "n/a" (formatTime defaultTimeLocale "%Y-%m-%dT%H:%M:%SZ" . roundStart) (listToMaybe stats)
     , replicate 56 '='
     , ""
     , "Config: "
@@ -169,6 +180,7 @@ renderReport RunConfig{cfgRounds, cfgTxsPerRound, cfgSeed, cfgStuckTimeout} stat
         , "  TxValid           : " <> show (txValidCount rs)
         , "  TxInvalid         : " <> show (txInvalidCount rs)
         , "  SnapshotConfirmed : " <> show (snapshotCount rs)
+        , "  Throughput        : " <> renderThroughput (roundThroughputTps rs) <> if floodPeakTps rs > 0 then " (flood peak: " <> renderThroughput (floodPeakTps rs) <> ")" else ""
         , "  Avg latency       : " <> renderLatency (snapshotLatencies rs)
         , "  Deposits finalized: " <> show (depositsFinalized rs)
         , "  Deposits expired  : " <> show (depositsExpired rs)
@@ -176,6 +188,11 @@ renderReport RunConfig{cfgRounds, cfgTxsPerRound, cfgSeed, cfgStuckTimeout} stat
         , "  L1 balance        : " <> renderL1Balance rs
         , ""
         ]
+
+  renderThroughput :: Double -> String
+  renderThroughput tps
+    | tps <= 0 = "n/a"
+    | otherwise = show (round tps :: Int) <> " tx/s"
 
   renderLatency :: [NominalDiffTime] -> String
   renderLatency [] = "n/a"
@@ -193,6 +210,10 @@ renderReport RunConfig{cfgRounds, cfgTxsPerRound, cfgSeed, cfgStuckTimeout} stat
   renderL1Balance :: RoundStats -> String
   renderL1Balance rs
     | l1LovelaceBefore rs == 0 = "not measured"
+    | isJust (roundFailure rs) && l1LovelaceAfter rs == 0 =
+        "before="
+          <> show (l1LovelaceBefore rs)
+          <> " after=n/a (round failed before fanout)"
     | otherwise =
         let before = l1LovelaceBefore rs
             after = l1LovelaceAfter rs
@@ -212,9 +233,12 @@ renderReport RunConfig{cfgRounds, cfgTxsPerRound, cfgSeed, cfgStuckTimeout} stat
     let completed = length $ filter (isNothing . roundFailure) ss
         total = sum [sum (Map.elems (actionCounts rs)) | rs <- ss]
         bugs = length $ filter (isJust . roundFailure) ss
+        allTps = [roundThroughputTps s | s <- ss, roundThroughputTps s > 0]
+        avgTps = if null allTps then 0.0 else sum allTps / fromIntegral (length allTps)
      in [ "OVERALL"
         , "  Rounds completed: " <> show completed <> "/" <> show (length ss)
         , "  Total actions   : " <> show total
+        , "  Avg throughput  : " <> (if avgTps <= 0 then "n/a" else show (round avgTps :: Int) <> " tx/s")
         , "  Bugs found      : " <> show bugs
         ]
 
@@ -240,12 +264,13 @@ renderActionEntry ActionEntry{aeTimestamp, aeActorId, aeTag} =
             <> actionTagLabel aeTag
 
 renderFailureReport :: FailureReport -> String
-renderFailureReport FailureReport{frRound, frFailureType, frActionLog, frServerOutputLog, frPersistenceLogPaths} =
+renderFailureReport FailureReport{frRound, frFailureType, frRawException, frActionLog, frServerOutputLog, frPersistenceLogPaths} =
   intercalate "\n" $
-    [ "FAILURE REPORT — Round " <> show frRound
+    [ "FAILURE REPORT \x2014 Round " <> show frRound
     , replicate 40 '='
     , ""
     , "Failure  : " <> failureLabel frFailureType
+    , "Exception: " <> take 800 frRawException
     , ""
     , "Action timeline (" <> show (length frActionLog) <> " actions):"
     ]

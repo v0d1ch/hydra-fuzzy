@@ -19,7 +19,7 @@ packages: hydra-fuzzy.cabal
 source-repository-package
   type: git
   location: https://github.com/cardano-scaling/hydra
-  tag: 6c503e77d0d21aa50c504d3d9b84a4fd7a22c590
+  tag: 03b2c7c82662b00525b32c8073c24cf74b37289d
   subdir:
     hydra-prelude
     hydra-cardano-api
